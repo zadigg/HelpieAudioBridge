@@ -1,0 +1,16 @@
+{
+  "name": "helpie-audio-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Native macOS ScreenCaptureKit audio capture bridge for Electron/Node.",
+  "main": "bin/arm64/audio_capture_arm64.node",
+  "scripts": {
+    "build": "./build.sh",
+    "check": "node -e \"const { AudioCapture } = require('./bin/arm64/audio_capture_arm64.node'); const cap = new AudioCapture(); console.log(typeof cap.startCapture, typeof cap.stopCapture, typeof cap.onData, typeof cap.clearCallback);\""
+  },
+  "devDependencies": {
+    "node-addon-api": "^8.3.0",
+    "node-gyp": "10.2.0"
+  }
+}
+

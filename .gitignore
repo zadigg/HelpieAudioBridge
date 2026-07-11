@@ -1,0 +1,7 @@
+build/
+node_modules/
+*.log
+*.old
+*.dSYM/
+.DS_Store
+
