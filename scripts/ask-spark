@@ -7,6 +7,7 @@ mkdir -p "$LOG_DIR"
 
 MODEL="${SPARK_MODEL:-meta/muse-spark-1.1}"
 TITLE="${SPARK_TITLE:-Spark handoff}"
+WORK_DIR="${SPARK_WORKDIR:-$ROOT_DIR}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 PROMPT_FILE="$LOG_DIR/spark-prompt-$STAMP.md"
 RESPONSE_FILE="$LOG_DIR/spark-response-$STAMP.md"
@@ -27,13 +28,13 @@ cp "$PROMPT_FILE" "$LATEST_PROMPT"
 
 {
   echo "Model: $MODEL"
-  echo "Repo: $ROOT_DIR"
+  echo "Repo: $WORK_DIR"
   echo "Prompt: $PROMPT_FILE"
   echo
   opencode run \
     --model "$MODEL" \
     --title "$TITLE" \
-    --dir "$ROOT_DIR" \
+    --dir "$WORK_DIR" \
     --format default \
     "$(cat "$PROMPT_FILE")"
 } | tee "$RESPONSE_FILE"
@@ -41,4 +42,3 @@ cp "$PROMPT_FILE" "$LATEST_PROMPT"
 cp "$RESPONSE_FILE" "$LATEST_RESPONSE"
 echo
 echo "Saved Spark response: $RESPONSE_FILE"
-
