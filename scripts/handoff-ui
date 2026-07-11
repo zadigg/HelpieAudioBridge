@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+import argparse
+import html
+import json
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HANDOFF = ROOT / ".ai-handoff"
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def handoff_items():
+    HANDOFF.mkdir(exist_ok=True)
+    prompts = {p.name.replace("spark-prompt-", "").replace(".md", ""): p for p in HANDOFF.glob("spark-prompt-*.md")}
+    responses = {p.name.replace("spark-response-", "").replace(".md", ""): p for p in HANDOFF.glob("spark-response-*.md")}
+    keys = sorted(set(prompts) | set(responses), reverse=True)
+    return [
+        {
+            "id": key,
+            "prompt": prompts.get(key).name if key in prompts else None,
+            "response": responses.get(key).name if key in responses else None,
+            "promptText": read_text(prompts[key]) if key in prompts else "",
+            "responseText": read_text(responses[key]) if key in responses else "",
+        }
+        for key in keys
+    ]
+
+
+INDEX = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Helpie AI Handoff</title>
+  <style>
+    :root { color-scheme: dark; --bg:#070b12; --panel:#0d1420; --line:#24324a; --text:#e8eefc; --muted:#94a3b8; --accent:#27c2d8; --good:#5ee090; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    header { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:14px 18px; background:rgba(7,11,18,.9); border-bottom:1px solid var(--line); backdrop-filter: blur(12px); }
+    h1 { margin:0; font-size:18px; letter-spacing:.2px; }
+    .status { display:flex; align-items:center; gap:8px; color:var(--muted); }
+    .dot { width:9px; height:9px; border-radius:50%; background:var(--good); box-shadow:0 0 16px var(--good); }
+    main { display:grid; grid-template-columns:280px 1fr; min-height:calc(100vh - 58px); }
+    nav { border-right:1px solid var(--line); padding:12px; overflow:auto; }
+    button.item { width:100%; text-align:left; color:var(--text); background:transparent; border:1px solid transparent; border-radius:8px; padding:10px; cursor:pointer; }
+    button.item:hover, button.item.active { border-color:var(--line); background:#111a2a; }
+    .id { font-weight:800; }
+    .meta { color:var(--muted); font-size:12px; margin-top:3px; }
+    section { display:grid; grid-template-rows:auto 1fr; min-width:0; }
+    .toolbar { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); }
+    .toolbar code { color:#bfefff; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px; min-height:0; }
+    .pane { min-width:0; min-height:0; display:flex; flex-direction:column; border:1px solid var(--line); border-radius:10px; background:var(--panel); overflow:hidden; }
+    .pane h2 { margin:0; padding:10px 12px; font-size:13px; color:var(--muted); border-bottom:1px solid var(--line); text-transform:uppercase; letter-spacing:.08em; }
+    pre { flex:1; margin:0; padding:14px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    .empty { color:var(--muted); }
+    @media (max-width: 900px) {
+      main { grid-template-columns:1fr; }
+      nav { border-right:0; border-bottom:1px solid var(--line); max-height:180px; }
+      .grid { grid-template-columns:1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Helpie AI Handoff</h1>
+    <div class="status"><span class="dot"></span><span id="status">Watching .ai-handoff</span></div>
+  </header>
+  <main>
+    <nav id="list"></nav>
+    <section>
+      <div class="toolbar">
+        <div>Selected: <code id="selected">latest</code></div>
+        <div class="meta">Auto-refreshes every 3s</div>
+      </div>
+      <div class="grid">
+        <article class="pane"><h2>Codex → Spark Prompt</h2><pre id="prompt" class="empty">Loading...</pre></article>
+        <article class="pane"><h2>Spark → Codex Response</h2><pre id="response" class="empty">Loading...</pre></article>
+      </div>
+    </section>
+  </main>
+  <script>
+    let selected = null;
+    async function load() {
+      const res = await fetch('/api/handoff', { cache: 'no-store' });
+      const data = await res.json();
+      const items = data.items || [];
+      if (!selected && items.length) selected = items[0].id;
+      if (selected && !items.find(i => i.id === selected) && items.length) selected = items[0].id;
+      const list = document.getElementById('list');
+      list.innerHTML = items.map(i => `
+        <button class="item ${i.id === selected ? 'active' : ''}" data-id="${i.id}">
+          <div class="id">${i.id}</div>
+          <div class="meta">${i.prompt ? 'prompt' : 'no prompt'} · ${i.response ? 'response' : 'no response'}</div>
+        </button>
+      `).join('') || '<div class="meta">No handoff files yet.</div>';
+      list.querySelectorAll('button.item').forEach(btn => btn.onclick = () => { selected = btn.dataset.id; render(items); });
+      render(items);
+      document.getElementById('status').textContent = `Watching .ai-handoff · ${new Date().toLocaleTimeString()}`;
+    }
+    function render(items) {
+      const item = items.find(i => i.id === selected) || items[0] || {};
+      document.getElementById('selected').textContent = item.id || 'none';
+      document.getElementById('prompt').textContent = item.promptText || 'No prompt yet.';
+      document.getElementById('response').textContent = item.responseText || 'No response yet.';
+      document.querySelectorAll('button.item').forEach(btn => btn.classList.toggle('active', btn.dataset.id === (item.id || selected)));
+    }
+    load();
+    setInterval(load, 3000);
+  </script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/handoff":
+            data = json.dumps({"items": handoff_items()}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path in ("/", "/index.html"):
+            data = INDEX.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Serve a local viewer for Codex/Spark handoff logs.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("HANDOFF_UI_PORT", "8787")))
+    args = parser.parse_args()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Handoff UI: http://{args.host}:{args.port}")
+    print(f"Reading: {HANDOFF}")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
+
