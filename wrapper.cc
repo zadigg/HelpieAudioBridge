@@ -28,7 +28,6 @@ private:
   int sampleRate_;
   int channels_;
   int batchFrames_;
-  bool downmixMono_;
 
   static void AudioCallback(const float* data, int32_t frames, int32_t channels, void* userData);
   void ProcessBatched();
@@ -53,12 +52,11 @@ Napi::Object AudioCaptureWrapper::Init(Napi::Env env, Napi::Object exports) {
 AudioCaptureWrapper::AudioCaptureWrapper(const Napi::CallbackInfo& info)
   : Napi::ObjectWrap<AudioCaptureWrapper>(info),
     captureHandle_(nullptr),
+    hasCallback_(false),
+    pendingBatch_(false),
     sampleRate_(48000),
     channels_(2),
-    batchFrames_(4800),
-    downmixMono_(false),
-    hasCallback_(false),
-    pendingBatch_(false) {
+    batchFrames_(4800) {
   Napi::Env env = info.Env();
   ringBuffer_ = std::make_unique<AudioRingBuffer>(sampleRate_ * 10, 2);
   captureHandle_ = AudioCapture_create();

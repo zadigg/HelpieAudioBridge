@@ -180,7 +180,7 @@
         } else {
           // Non-interleaved deinterleave
           for (int i = 0; i < numSamples; i++) {
-            for (int ch = 0; ch < _channels && ch < bufferList->mNumberBuffers; ch++) {
+            for (UInt32 ch = 0; ch < (UInt32)_channels && ch < bufferList->mNumberBuffers; ch++) {
               float* src = (float*)bufferList->mBuffers[ch].mData;
               temp[i * _channels + ch] = src ? src[i] : 0.0f;
             }

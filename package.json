@@ -3,10 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "description": "Native macOS ScreenCaptureKit audio capture bridge for Electron/Node.",
-  "main": "bin/arm64/audio_capture_arm64.node",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "bin/",
+    "audio_capture.h",
+    "audio_capture.mm",
+    "wrapper.cc",
+    "ring_buffer.h",
+    "binding.gyp",
+    "build.sh",
+    "README.md"
+  ],
   "scripts": {
     "build": "./build.sh",
-    "check": "node -e \"const { AudioCapture } = require('./bin/arm64/audio_capture_arm64.node'); const cap = new AudioCapture(); console.log(typeof cap.startCapture, typeof cap.stopCapture, typeof cap.onData, typeof cap.clearCallback);\""
+    "check": "node -e \"const { AudioCapture } = require('./'); const cap = new AudioCapture(); console.log(typeof cap.startCapture, typeof cap.stopCapture, typeof cap.onData, typeof cap.clearCallback);\""
   },
   "devDependencies": {
     "node-addon-api": "^8.3.0",
