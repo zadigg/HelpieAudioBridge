@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOG_DIR="$ROOT_DIR/.ai-handoff"
+mkdir -p "$LOG_DIR"
+
+MODEL="${SPARK_MODEL:-meta/muse-spark-1.1}"
+TITLE="${SPARK_TITLE:-Spark handoff}"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+PROMPT_FILE="$LOG_DIR/spark-prompt-$STAMP.md"
+RESPONSE_FILE="$LOG_DIR/spark-response-$STAMP.md"
+LATEST_PROMPT="$LOG_DIR/latest-prompt.md"
+LATEST_RESPONSE="$LOG_DIR/latest-response.md"
+
+if [ "$#" -gt 0 ]; then
+  printf '%s\n' "$*" > "$PROMPT_FILE"
+elif [ ! -t 0 ]; then
+  cat > "$PROMPT_FILE"
+else
+  echo "Usage: scripts/ask-spark \"prompt\""
+  echo "   or: command | scripts/ask-spark"
+  exit 2
+fi
+
+cp "$PROMPT_FILE" "$LATEST_PROMPT"
+
+{
+  echo "Model: $MODEL"
+  echo "Repo: $ROOT_DIR"
+  echo "Prompt: $PROMPT_FILE"
+  echo
+  opencode run \
+    --model "$MODEL" \
+    --title "$TITLE" \
+    --dir "$ROOT_DIR" \
+    --format default \
+    "$(cat "$PROMPT_FILE")"
+} | tee "$RESPONSE_FILE"
+
+cp "$RESPONSE_FILE" "$LATEST_RESPONSE"
+echo
+echo "Saved Spark response: $RESPONSE_FILE"
+
