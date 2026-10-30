@@ -1,86 +1,116 @@
 #pragma once
-#include <atomic>
-#include <cstdint>
+
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
-// SPSC lock-free ring buffer for float audio, optimized for single producer (SCStream thread)
-// and single consumer (JS callback thread / timer). No locks, cache-friendly.
+// Interleaved float audio. push, pop, and reset are safe to call from
+// different threads. Capacity is a fixed number of frames.
 class AudioRingBuffer {
-public:
-  explicit AudioRingBuffer(size_t capacityFrames, size_t channels)
-    : capacity_(capacityFrames * channels),
-      channels_(channels),
-      buffer_(capacity_),
-      head_(0),
-      tail_(0),
-      size_(0) {}
+ public:
+  AudioRingBuffer(size_t capacityFrames, size_t channels) {
+    reconfigure(capacityFrames, channels);
+  }
 
-  // Producer: push interleaved float samples, returns number of frames actually written (drops oldest if full)
+  void reconfigure(size_t capacityFrames, size_t channels) {
+    std::lock_guard<std::mutex> lock(mu_);
+    channels_ = channels == 0 ? 1 : channels;
+    if (capacityFrames == 0) capacityFrames = 1;
+    capacity_ = capacityFrames * channels_;
+    buffer_.assign(capacity_, 0.0f);
+    head_ = 0;
+    tail_ = 0;
+    size_ = 0;
+  }
+
   size_t push(const float* data, size_t frames) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!data || frames == 0 || channels_ == 0 || capacity_ == 0) return 0;
     size_t samples = frames * channels_;
-    if (samples == 0) return 0;
-    if (samples > capacity_) {
-      // If chunk larger than capacity, keep only tail
-      data += samples - capacity_;
-      samples = capacity_;
-      frames = capacity_ / channels_;
+    if (samples >= capacity_) {
+      size_t keep = capacity_ - (capacity_ % channels_);
+      if (keep == 0) return 0;
+      data += samples - keep;
+      samples = keep;
+      frames = keep / channels_;
+      head_ = 0;
+      tail_ = 0;
+      size_ = 0;
+    } else if (size_ + samples > capacity_) {
+      DropOldestUnlocked(size_ + samples - capacity_);
     }
-    size_t currentSize = size_.load(std::memory_order_relaxed);
-    // If would overflow, drop oldest
-    if (currentSize + samples > capacity_) {
-      size_t overflow = currentSize + samples - capacity_;
-      // Advance head by overflow (rounded to frame boundary)
-      size_t overflowFrames = (overflow + channels_ - 1) / channels_;
-      head_.store((head_.load(std::memory_order_relaxed) + overflowFrames * channels_) % capacity_, std::memory_order_release);
-      size_.store(capacity_ - samples, std::memory_order_release);
+    size_t tail = tail_;
+    size_t first = std::min(samples, capacity_ - tail);
+    std::memcpy(buffer_.data() + tail, data, first * sizeof(float));
+    if (first < samples) {
+      std::memcpy(buffer_.data(), data + first, (samples - first) * sizeof(float));
     }
-    size_t tail = tail_.load(std::memory_order_relaxed);
-    size_t firstChunk = std::min(samples, capacity_ - tail);
-    std::memcpy(buffer_.data() + tail, data, firstChunk * sizeof(float));
-    if (firstChunk < samples) {
-      std::memcpy(buffer_.data(), data + firstChunk, (samples - firstChunk) * sizeof(float));
-    }
-    tail_.store((tail + samples) % capacity_, std::memory_order_release);
-    size_.fetch_add(samples, std::memory_order_release);
+    tail_ = (tail + samples) % capacity_;
+    size_ += samples;
     return frames;
   }
 
-  // Consumer: pop up to maxFrames, returns frames popped
-  size_t pop(float* out, size_t maxFrames) {
-    size_t availableSamples = size_.load(std::memory_order_acquire);
-    size_t availableFrames = availableSamples / channels_;
-    size_t toReadFrames = std::min(maxFrames, availableFrames);
-    if (toReadFrames == 0) return 0;
-    size_t toReadSamples = toReadFrames * channels_;
-    size_t head = head_.load(std::memory_order_relaxed);
-    size_t firstChunk = std::min(toReadSamples, capacity_ - head);
-    std::memcpy(out, buffer_.data() + head, firstChunk * sizeof(float));
-    if (firstChunk < toReadSamples) {
-      std::memcpy(out + firstChunk, buffer_.data(), (toReadSamples - firstChunk) * sizeof(float));
+  // Drops older frames until only maxFrames remain, then copies those.
+  size_t popLatest(float* out, size_t maxFrames) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!out || maxFrames == 0 || channels_ == 0) return 0;
+    size_t available = size_ / channels_;
+    if (available == 0) return 0;
+    if (available > maxFrames) {
+      DropOldestUnlocked((available - maxFrames) * channels_);
     }
-    head_.store((head + toReadSamples) % capacity_, std::memory_order_release);
-    size_.fetch_sub(toReadSamples, std::memory_order_release);
-    return toReadFrames;
+    return PopUnlocked(out, maxFrames);
   }
 
   size_t availableFrames() const {
-    return size_.load(std::memory_order_acquire) / channels_;
+    std::lock_guard<std::mutex> lock(mu_);
+    if (channels_ == 0) return 0;
+    return size_ / channels_;
   }
 
   void reset() {
-    head_.store(0, std::memory_order_release);
-    tail_.store(0, std::memory_order_release);
-    size_.store(0, std::memory_order_release);
+    std::lock_guard<std::mutex> lock(mu_);
+    head_ = 0;
+    tail_ = 0;
+    size_ = 0;
   }
 
-  size_t channels() const { return channels_; }
+  size_t channels() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return channels_;
+  }
 
-private:
-  size_t capacity_;
-  size_t channels_;
+ private:
+  void DropOldestUnlocked(size_t samples) {
+    if (samples > size_) samples = size_;
+    samples -= samples % channels_;
+    head_ = (head_ + samples) % capacity_;
+    size_ -= samples;
+  }
+
+  size_t PopUnlocked(float* out, size_t frames) {
+    size_t available = size_ / channels_;
+    size_t n = std::min(frames, available);
+    if (n == 0) return 0;
+    size_t samples = n * channels_;
+    size_t head = head_;
+    size_t first = std::min(samples, capacity_ - head);
+    std::memcpy(out, buffer_.data() + head, first * sizeof(float));
+    if (first < samples) {
+      std::memcpy(out + first, buffer_.data(), (samples - first) * sizeof(float));
+    }
+    head_ = (head + samples) % capacity_;
+    size_ -= samples;
+    return n;
+  }
+
+  mutable std::mutex mu_;
+  size_t capacity_ = 0;
+  size_t channels_ = 0;
   std::vector<float> buffer_;
-  std::atomic<size_t> head_;
-  std::atomic<size_t> tail_;
-  std::atomic<size_t> size_;
+  size_t head_ = 0;
+  size_t tail_ = 0;
+  size_t size_ = 0;
 };

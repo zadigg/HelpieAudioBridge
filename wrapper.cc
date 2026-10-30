@@ -1,47 +1,260 @@
 #include <napi.h>
+
 #include "audio_capture.h"
 #include "ring_buffer.h"
+
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <memory>
-#include <vector>
 #include <mutex>
+#include <string>
+#include <vector>
+
+class AudioCaptureWrapper;
+
+namespace {
+
+const char* CodeForStatus(int status) {
+  switch (status) {
+    case AUDIO_CAPTURE_PERMISSION_DENIED:
+      return "permission-denied";
+    case AUDIO_CAPTURE_NO_DISPLAY:
+      return "no-display";
+    case AUDIO_CAPTURE_TIMEOUT:
+      return "timeout";
+    default:
+      return "stream-failed";
+  }
+}
+
+Napi::Error MakeAudioError(Napi::Env env, int status, const std::string& message) {
+  const char* code = CodeForStatus(status);
+  std::string text = message.empty() ? code : message;
+  Napi::Error error = Napi::Error::New(env, text);
+  error.Set("code", Napi::String::New(env, code));
+  error.Set("name", Napi::String::New(env, "AudioCaptureError"));
+  return error;
+}
+
+int ReadIntOption(Napi::Env env, const Napi::Object& options, const char* key, int fallback, int min,
+                  int max) {
+  if (!options.Has(key) || options.Get(key).IsUndefined() || options.Get(key).IsNull()) {
+    return fallback;
+  }
+  Napi::Value value = options.Get(key);
+  if (!value.IsNumber()) {
+    throw Napi::TypeError::New(env, std::string(key) + " must be an integer.");
+  }
+  double number = value.As<Napi::Number>().DoubleValue();
+  if (!std::isfinite(number) || std::floor(number) != number) {
+    throw Napi::TypeError::New(env, std::string(key) + " must be an integer.");
+  }
+  int parsed = static_cast<int>(number);
+  if (parsed < min || parsed > max) {
+    throw Napi::RangeError::New(env, std::string(key) + " is outside the supported range.");
+  }
+  return parsed;
+}
+
+int BatchFramesFor(int sampleRate, int batchMs) {
+  int frames = sampleRate * batchMs / 1000;
+  return frames < 1 ? 1 : frames;
+}
+
+int CapacityFramesFor(int sampleRate, int batchMs) {
+  int halfSecond = sampleRate / 2;
+  if (halfSecond < 1) halfSecond = 1;
+  int twoBatches = BatchFramesFor(sampleRate, batchMs) * 2;
+  return halfSecond > twoBatches ? halfSecond : twoBatches;
+}
+
+struct DataPayload {
+  std::vector<float> samples;
+  int channels = 0;
+  int frames = 0;
+  int sampleRate = 0;
+  double timestamp = 0;
+  std::shared_ptr<std::atomic<bool>> pending;
+};
+
+struct StoppedPayload {
+  AudioCaptureWrapper* self = nullptr;
+  int status = AUDIO_CAPTURE_STREAM_FAILED;
+  std::string message;
+};
+
+}  // namespace
 
 class AudioCaptureWrapper : public Napi::ObjectWrap<AudioCaptureWrapper> {
-public:
+ public:
   static Napi::Object Init(Napi::Env env, Napi::Object exports);
   AudioCaptureWrapper(const Napi::CallbackInfo& info);
   ~AudioCaptureWrapper();
 
-private:
+  friend class StartTask;
+  friend class StopTask;
+
+ private:
   static Napi::FunctionReference constructor;
-  Napi::Value StartCapture(const Napi::CallbackInfo& info);
-  Napi::Value StopCapture(const Napi::CallbackInfo& info);
-  Napi::Value OnData(const Napi::CallbackInfo& info);
-  Napi::Value ClearCallback(const Napi::CallbackInfo& info);
+  static void OnNativeData(const AudioCaptureChunk* chunk, void* userData);
+  static void OnNativeStopped(int status, const char* message, void* userData);
 
-  void* captureHandle_;
-  std::unique_ptr<AudioRingBuffer> ringBuffer_;
-  Napi::ThreadSafeFunction tsfn_;
-  std::mutex tsfnMutex_; // protects tsfn_ replacement, release, and NonBlockingCall
-  std::atomic<bool> hasCallback_;
-  std::atomic<bool> pendingBatch_; // true if one JS callback queued, drop intermediate
-  int sampleRate_;
-  int channels_;
-  int batchFrames_;
+  Napi::Value Start(const Napi::CallbackInfo& info);
+  Napi::Value Stop(const Napi::CallbackInfo& info);
+  Napi::Value On(const Napi::CallbackInfo& info);
+  Napi::Value Close(const Napi::CallbackInfo& info);
 
-  static void AudioCallback(const float* data, int32_t frames, int32_t channels, void* userData);
-  void ProcessBatched();
+  void ScheduleBatch(int sampleRate, double timestamp);
+  void MarkRunning(Napi::Env env);
+  void MarkStopped(Napi::Env env);
+  void ReleaseListeners(Napi::Env env);
+  Napi::Promise::Deferred QueueStop(Napi::Env env);
+
+  void* handle_ = nullptr;
+  std::unique_ptr<AudioRingBuffer> ring_;
+  std::mutex callbackMu_;
+  std::mutex opMutex_;
+  std::shared_ptr<std::atomic<bool>> pending_;
+  Napi::ThreadSafeFunction dataTsfn_;
+  Napi::ThreadSafeFunction stoppedTsfn_;
+  Napi::FunctionReference stoppedFn_;
+  bool hasData_ = false;
+  bool dataHeld_ = false;
+  bool hasStopped_ = false;
+  bool stoppedHeld_ = false;
+  std::atomic<bool> acceptAudio_{false};
+  std::atomic<bool> closed_{false};
+  std::atomic<bool> running_{false};
+  std::atomic<bool> sessionEnded_{false};
+  std::atomic<bool> published_{false};
+  int sampleRate_ = 48000;
+  int channels_ = 2;
+  int batchMs_ = 100;
+  int batchFrames_ = 4800;
+  int capacityFrames_ = 24000;
+  int observedRate_ = 48000;
+  double latestTimestamp_ = 0;
+};
+
+class StartTask : public Napi::AsyncWorker {
+ public:
+  StartTask(Napi::Env env, AudioCaptureWrapper* self, Napi::Promise::Deferred deferred)
+      : Napi::AsyncWorker(env, "AudioCapture.start"), self_(self), deferred_(deferred) {}
+
+  void Execute() override {
+    std::lock_guard<std::mutex> lock(self_->opMutex_);
+    self_->acceptAudio_.store(false, std::memory_order_release);
+    if (self_->handle_) AudioCapture_stop(self_->handle_);
+    if (self_->ring_) self_->ring_->reset();
+    if (self_->closed_.load()) {
+      status_ = AUDIO_CAPTURE_STREAM_FAILED;
+      message_ = "AudioCapture is closed.";
+      return;
+    }
+    self_->sessionEnded_.store(false);
+    self_->published_.store(false);
+    self_->observedRate_ = self_->sampleRate_;
+    self_->batchFrames_ = BatchFramesFor(self_->sampleRate_, self_->batchMs_);
+    self_->latestTimestamp_ = 0;
+    self_->pending_->store(false);
+    self_->acceptAudio_.store(true, std::memory_order_release);
+
+    char message[512];
+    message[0] = '\0';
+    status_ = self_->handle_ ? AudioCapture_start(self_->handle_, message, sizeof(message))
+                             : AUDIO_CAPTURE_STREAM_FAILED;
+    message_ = message;
+    if (self_->closed_.load() || self_->sessionEnded_.load() || status_ != AUDIO_CAPTURE_OK ||
+        !AudioCapture_isCapturing(self_->handle_)) {
+      self_->acceptAudio_.store(false, std::memory_order_release);
+      if (self_->handle_) AudioCapture_stop(self_->handle_);
+      if (status_ == AUDIO_CAPTURE_OK) {
+        status_ = AUDIO_CAPTURE_STREAM_FAILED;
+        if (message_.empty()) {
+          message_ = self_->closed_.load() ? "AudioCapture is closed."
+                                           : "Capture stopped before it was ready.";
+        }
+      }
+    }
+  }
+
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
+    if (status_ == AUDIO_CAPTURE_OK && !self_->sessionEnded_.load() && !self_->closed_.load()) {
+      self_->published_.store(true);
+      self_->MarkRunning(Env());
+      deferred_.Resolve(Env().Undefined());
+    } else {
+      self_->published_.store(false);
+      if (status_ == AUDIO_CAPTURE_OK) {
+        status_ = AUDIO_CAPTURE_STREAM_FAILED;
+        if (message_.empty()) {
+          message_ = self_->closed_.load() ? "AudioCapture is closed."
+                                           : "Capture stopped before it was ready.";
+        }
+      }
+      self_->MarkStopped(Env());
+      deferred_.Reject(MakeAudioError(Env(), status_, message_).Value());
+    }
+    self_->Unref();
+  }
+
+  void OnError(const Napi::Error& error) override {
+    Napi::HandleScope scope(Env());
+    self_->acceptAudio_.store(false, std::memory_order_release);
+    self_->MarkStopped(Env());
+    deferred_.Reject(error.Value());
+    self_->Unref();
+  }
+
+ private:
+  AudioCaptureWrapper* self_;
+  Napi::Promise::Deferred deferred_;
+  int status_ = AUDIO_CAPTURE_STREAM_FAILED;
+  std::string message_;
+};
+
+class StopTask : public Napi::AsyncWorker {
+ public:
+  StopTask(Napi::Env env, AudioCaptureWrapper* self, Napi::Promise::Deferred deferred)
+      : Napi::AsyncWorker(env, "AudioCapture.stop"), self_(self), deferred_(deferred) {}
+
+  void Execute() override {
+    std::lock_guard<std::mutex> lock(self_->opMutex_);
+    self_->acceptAudio_.store(false, std::memory_order_release);
+    if (self_->handle_) AudioCapture_stop(self_->handle_);
+    if (self_->ring_) self_->ring_->reset();
+    self_->pending_->store(false);
+  }
+
+  void OnOK() override {
+    Napi::HandleScope scope(Env());
+    self_->MarkStopped(Env());
+    deferred_.Resolve(Env().Undefined());
+    self_->Unref();
+  }
+
+  void OnError(const Napi::Error& error) override {
+    Napi::HandleScope scope(Env());
+    self_->MarkStopped(Env());
+    deferred_.Reject(error.Value());
+    self_->Unref();
+  }
+
+ private:
+  AudioCaptureWrapper* self_;
+  Napi::Promise::Deferred deferred_;
 };
 
 Napi::FunctionReference AudioCaptureWrapper::constructor;
 
 Napi::Object AudioCaptureWrapper::Init(Napi::Env env, Napi::Object exports) {
-  Napi::HandleScope scope(env);
   Napi::Function func = DefineClass(env, "AudioCapture", {
-    InstanceMethod("startCapture", &AudioCaptureWrapper::StartCapture),
-    InstanceMethod("stopCapture", &AudioCaptureWrapper::StopCapture),
-    InstanceMethod("onData", &AudioCaptureWrapper::OnData),
-    InstanceMethod("clearCallback", &AudioCaptureWrapper::ClearCallback),
+    InstanceMethod("start", &AudioCaptureWrapper::Start),
+    InstanceMethod("stop", &AudioCaptureWrapper::Stop),
+    InstanceMethod("on", &AudioCaptureWrapper::On),
+    InstanceMethod("close", &AudioCaptureWrapper::Close),
   });
   constructor = Napi::Persistent(func);
   constructor.SuppressDestruct();
@@ -50,170 +263,317 @@ Napi::Object AudioCaptureWrapper::Init(Napi::Env env, Napi::Object exports) {
 }
 
 AudioCaptureWrapper::AudioCaptureWrapper(const Napi::CallbackInfo& info)
-  : Napi::ObjectWrap<AudioCaptureWrapper>(info),
-    captureHandle_(nullptr),
-    hasCallback_(false),
-    pendingBatch_(false),
-    sampleRate_(48000),
-    channels_(2),
-    batchFrames_(4800) {
+    : Napi::ObjectWrap<AudioCaptureWrapper>(info),
+      pending_(std::make_shared<std::atomic<bool>>(false)) {
   Napi::Env env = info.Env();
-  ringBuffer_ = std::make_unique<AudioRingBuffer>(sampleRate_ * 10, 2);
-  captureHandle_ = AudioCapture_create();
-  if (!captureHandle_) {
-    Napi::Error::New(env, "Failed to create audio capture").ThrowAsJavaScriptException();
+  bool excludes = true;
+  if (info.Length() >= 1 && !info[0].IsUndefined() && !info[0].IsNull()) {
+    if (!info[0].IsObject()) {
+      throw Napi::TypeError::New(env, "Options must be an object.");
+    }
+    Napi::Object options = info[0].As<Napi::Object>();
+    sampleRate_ = ReadIntOption(env, options, "sampleRate", 48000, 8000, 96000);
+    channels_ = ReadIntOption(env, options, "channels", 2, 1, 2);
+    batchMs_ = ReadIntOption(env, options, "batchMs", 100, 20, 500);
+    if (options.Has("excludesCurrentProcessAudio") &&
+        !options.Get("excludesCurrentProcessAudio").IsUndefined()) {
+      Napi::Value flag = options.Get("excludesCurrentProcessAudio");
+      if (!flag.IsBoolean()) {
+        throw Napi::TypeError::New(env, "excludesCurrentProcessAudio must be a boolean.");
+      }
+      excludes = flag.As<Napi::Boolean>().Value();
+    }
   }
+
+  batchFrames_ = BatchFramesFor(sampleRate_, batchMs_);
+  capacityFrames_ = CapacityFramesFor(sampleRate_, batchMs_);
+  observedRate_ = sampleRate_;
+  ring_ = std::make_unique<AudioRingBuffer>(static_cast<size_t>(capacityFrames_),
+                                            static_cast<size_t>(channels_));
+  handle_ = AudioCapture_create(sampleRate_, channels_, excludes ? 1 : 0);
+  if (!handle_) {
+    throw Napi::Error::New(env, "Failed to create the audio capture.");
+  }
+  AudioCapture_setCallbacks(handle_, &AudioCaptureWrapper::OnNativeData,
+                            &AudioCaptureWrapper::OnNativeStopped, this);
+
+  Napi::Function noop = Napi::Function::New(env, [](const Napi::CallbackInfo& cbInfo) {
+    return cbInfo.Env().Undefined();
+  });
+  stoppedTsfn_ = Napi::ThreadSafeFunction::New(env, noop, "AudioCaptureStopped", 4, 1);
+  stoppedTsfn_.Unref(env);
+  hasStopped_ = true;
 }
 
 AudioCaptureWrapper::~AudioCaptureWrapper() {
-  {
-    std::lock_guard<std::mutex> lock(tsfnMutex_);
-    if (hasCallback_.load() && tsfn_) {
-      hasCallback_.store(false);
-      tsfn_.Release();
-    }
+  closed_.store(true);
+  acceptAudio_.store(false, std::memory_order_release);
+  if (handle_) {
+    AudioCapture_stop(handle_);
+    AudioCapture_destroy(handle_);
+    handle_ = nullptr;
   }
-  if (captureHandle_) {
-    AudioCapture_stopCapture(captureHandle_);
-    AudioCapture_destroy(captureHandle_);
-    captureHandle_ = nullptr;
+  std::lock_guard<std::mutex> lock(callbackMu_);
+  if (hasData_) {
+    dataTsfn_.Release();
+    hasData_ = false;
   }
+  if (hasStopped_) {
+    stoppedTsfn_.Release();
+    hasStopped_ = false;
+  }
+  if (!stoppedFn_.IsEmpty()) stoppedFn_.Reset();
 }
 
-Napi::Value AudioCaptureWrapper::StartCapture(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  if (!captureHandle_) return Napi::Boolean::New(env, false);
-  ringBuffer_->reset();
-  pendingBatch_.store(false);
-  int result = AudioCapture_startCapture(captureHandle_);
-  return Napi::Boolean::New(env, result != 0);
-}
-
-Napi::Value AudioCaptureWrapper::StopCapture(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  if (captureHandle_) {
-    AudioCapture_stopCapture(captureHandle_);
-    ringBuffer_->reset();
-    pendingBatch_.store(false);
+void AudioCaptureWrapper::OnNativeData(const AudioCaptureChunk* chunk, void* userData) {
+  auto* self = static_cast<AudioCaptureWrapper*>(userData);
+  if (!self || !chunk || !chunk->samples) return;
+  if (!self->acceptAudio_.load(std::memory_order_acquire) || self->closed_.load()) return;
+  if (chunk->frames <= 0 || chunk->channels <= 0 || chunk->channels > 8 || chunk->sampleRate <= 0) {
+    return;
   }
-  // Do NOT release TSFN on stop - keep callback for start/stop/start cycle
-  return env.Undefined();
-}
 
-Napi::Value AudioCaptureWrapper::ClearCallback(const Napi::CallbackInfo& info) {
-  std::lock_guard<std::mutex> lock(tsfnMutex_);
-  if (hasCallback_.load() && tsfn_) {
-    tsfn_.Release();
+  if (self->ring_->channels() != static_cast<size_t>(chunk->channels)) {
+    self->ring_->reconfigure(static_cast<size_t>(self->capacityFrames_),
+                             static_cast<size_t>(chunk->channels));
   }
-  hasCallback_.store(false);
-  pendingBatch_.store(false);
-  return info.Env().Undefined();
-}
-
-void AudioCaptureWrapper::AudioCallback(const float* data, int32_t frames, int32_t channels, void* userData) {
-  AudioCaptureWrapper* self = static_cast<AudioCaptureWrapper*>(userData);
-  if (!self || !self->hasCallback_.load()) return;
-  if (!data || frames <= 0) return;
-  self->ringBuffer_->push(data, frames);
-  if (self->ringBuffer_->availableFrames() >= (size_t)self->batchFrames_) {
-    self->ProcessBatched();
+  if (chunk->sampleRate != self->observedRate_) {
+    self->observedRate_ = chunk->sampleRate;
+    self->batchFrames_ = BatchFramesFor(self->observedRate_, self->batchMs_);
   }
+  self->latestTimestamp_ = chunk->timestamp;
+  self->ring_->push(chunk->samples, static_cast<size_t>(chunk->frames));
+  self->ScheduleBatch(chunk->sampleRate, self->latestTimestamp_);
 }
 
-void AudioCaptureWrapper::ProcessBatched() {
-  // Backpressure: only one pending JS callback at a time, drop intermediate
+void AudioCaptureWrapper::OnNativeStopped(int status, const char* message, void* userData) {
+  auto* self = static_cast<AudioCaptureWrapper*>(userData);
+  if (!self) return;
+  self->sessionEnded_.store(true);
+  self->acceptAudio_.store(false, std::memory_order_release);
+  if (self->closed_.load()) return;
+
+  auto* payload = new StoppedPayload();
+  payload->self = self;
+  payload->status = status == AUDIO_CAPTURE_OK ? AUDIO_CAPTURE_STREAM_FAILED : status;
+  payload->message = message ? message : "The system stopped audio capture.";
+
+  std::lock_guard<std::mutex> lock(self->callbackMu_);
+  if (!self->hasStopped_ || self->closed_.load()) {
+    delete payload;
+    return;
+  }
+  napi_status call = self->stoppedTsfn_.NonBlockingCall(
+      payload, [](Napi::Env env, Napi::Function /*noop*/, StoppedPayload* payload) {
+        Napi::HandleScope scope(env);
+        struct Guard {
+          StoppedPayload* payload;
+          ~Guard() { delete payload; }
+        } guard{payload};
+
+        AudioCaptureWrapper* self = payload->self;
+        if (!self || self->closed_.load() || !self->published_.load()) return;
+        int status = payload->status;
+        std::string message = payload->message;
+        self->published_.store(false);
+        self->MarkStopped(env);
+        if (self->stoppedFn_.IsEmpty()) return;
+        self->stoppedFn_.Call({MakeAudioError(env, status, message).Value()});
+      });
+  if (call != napi_ok) delete payload;
+}
+
+void AudioCaptureWrapper::ScheduleBatch(int sampleRate, double timestamp) {
+  if (ring_->availableFrames() < static_cast<size_t>(batchFrames_)) return;
   bool expected = false;
-  if (!pendingBatch_.compare_exchange_strong(expected, true)) {
-    // Already one queued, drop this batch - ring buffer keeps newest
-    // Pop and discard to avoid growing indefinitely? No, keep in ring, will be picked up next time JS drains
+  if (!pending_->compare_exchange_strong(expected, true)) return;
+
+  size_t channels = ring_->channels();
+  std::vector<float> samples(static_cast<size_t>(batchFrames_) * channels);
+  size_t frames = ring_->popLatest(samples.data(), static_cast<size_t>(batchFrames_));
+  if (frames == 0) {
+    pending_->store(false);
     return;
   }
+  samples.resize(frames * channels);
 
-  size_t framesToPop = batchFrames_;
-  std::vector<float> temp;
-  temp.resize(framesToPop * channels_);
-  size_t popped = ringBuffer_->pop(temp.data(), framesToPop);
-  if (popped == 0) {
-    pendingBatch_.store(false);
-    return;
-  }
-
-  struct CallbackData {
-    std::vector<float> samples;
-    int channels;
-    int frames;
-    std::atomic<bool>* pendingFlag;
-  };
-  CallbackData* cbData = new CallbackData();
-  cbData->samples = std::move(temp);
-  cbData->samples.resize(popped * channels_);
-  cbData->channels = channels_;
-  cbData->frames = popped;
-  cbData->pendingFlag = &pendingBatch_;
+  auto* payload = new DataPayload();
+  payload->samples = std::move(samples);
+  payload->channels = static_cast<int>(channels);
+  payload->frames = static_cast<int>(frames);
+  payload->sampleRate = sampleRate;
+  payload->timestamp = timestamp;
+  payload->pending = pending_;
 
   napi_status status = napi_generic_failure;
   {
-    std::lock_guard<std::mutex> lock(tsfnMutex_);
-    if (!hasCallback_.load() || !tsfn_) {
-      pendingBatch_.store(false);
-      delete cbData;
+    std::lock_guard<std::mutex> lock(callbackMu_);
+    if (!hasData_ || closed_.load()) {
+      pending_->store(false);
+      delete payload;
       return;
     }
+    status = dataTsfn_.NonBlockingCall(
+        payload, [](Napi::Env env, Napi::Function jsCallback, DataPayload* payload) {
+          struct Guard {
+            std::shared_ptr<std::atomic<bool>> pending;
+            DataPayload* payload;
+            ~Guard() {
+              if (pending) pending->store(false);
+              delete payload;
+            }
+          } guard{payload->pending, payload};
 
-    status = tsfn_.NonBlockingCall(cbData, [](Napi::Env env, Napi::Function jsCallback, CallbackData* data) {
-      size_t byteLength = data->samples.size() * sizeof(float);
-      Napi::ArrayBuffer arrayBuffer = Napi::ArrayBuffer::New(env, byteLength);
-      memcpy(arrayBuffer.Data(), data->samples.data(), byteLength);
-      Napi::Float32Array floatArray = Napi::Float32Array::New(env, data->samples.size(), arrayBuffer, 0);
-      jsCallback.Call({floatArray, Napi::Number::New(env, data->channels)});
-      data->pendingFlag->store(false);
-      delete data;
-    });
+          Napi::HandleScope scope(env);
+          size_t count = payload->samples.size();
+          Napi::ArrayBuffer buffer = Napi::ArrayBuffer::New(env, count * sizeof(float));
+          if (count > 0) {
+            std::memcpy(buffer.Data(), payload->samples.data(), count * sizeof(float));
+          }
+          Napi::Object chunk = Napi::Object::New(env);
+          chunk.Set("samples", Napi::Float32Array::New(env, count, buffer, 0));
+          chunk.Set("channels", Napi::Number::New(env, payload->channels));
+          chunk.Set("sampleRate", Napi::Number::New(env, payload->sampleRate));
+          chunk.Set("frames", Napi::Number::New(env, payload->frames));
+          chunk.Set("timestamp", Napi::Number::New(env, payload->timestamp));
+          jsCallback.Call({chunk});
+        });
   }
-
   if (status != napi_ok) {
-    pendingBatch_.store(false);
-    delete cbData;
+    pending_->store(false);
+    delete payload;
   }
 }
 
-Napi::Value AudioCaptureWrapper::OnData(const Napi::CallbackInfo& info) {
+void AudioCaptureWrapper::MarkRunning(Napi::Env env) {
+  if (closed_.load()) return;
+  if (running_.exchange(true)) return;
+  {
+    std::lock_guard<std::mutex> lock(callbackMu_);
+    if (hasData_ && !dataHeld_) {
+      dataTsfn_.Ref(env);
+      dataHeld_ = true;
+    }
+    if (hasStopped_ && !stoppedHeld_) {
+      stoppedTsfn_.Ref(env);
+      stoppedHeld_ = true;
+    }
+  }
+  Ref();
+}
+
+void AudioCaptureWrapper::MarkStopped(Napi::Env env) {
+  if (!running_.exchange(false)) return;
+  {
+    std::lock_guard<std::mutex> lock(callbackMu_);
+    if (dataHeld_) {
+      dataTsfn_.Unref(env);
+      dataHeld_ = false;
+    }
+    if (stoppedHeld_) {
+      stoppedTsfn_.Unref(env);
+      stoppedHeld_ = false;
+    }
+  }
+  Unref();
+}
+
+void AudioCaptureWrapper::ReleaseListeners(Napi::Env env) {
+  std::lock_guard<std::mutex> lock(callbackMu_);
+  if (dataHeld_) {
+    dataTsfn_.Unref(env);
+    dataHeld_ = false;
+  }
+  if (hasData_) {
+    dataTsfn_.Release();
+    hasData_ = false;
+  }
+  if (stoppedHeld_) {
+    stoppedTsfn_.Unref(env);
+    stoppedHeld_ = false;
+  }
+  if (hasStopped_) {
+    stoppedTsfn_.Release();
+    hasStopped_ = false;
+  }
+  if (!stoppedFn_.IsEmpty()) stoppedFn_.Reset();
+}
+
+Napi::Promise::Deferred AudioCaptureWrapper::QueueStop(Napi::Env env) {
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+  Ref();
+  StopTask* task = new StopTask(env, this, deferred);
+  task->Queue();
+  return deferred;
+}
+
+Napi::Value AudioCaptureWrapper::Start(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  if (info.Length() < 1 || !info[0].IsFunction()) {
-    Napi::TypeError::New(env, "Function expected").ThrowAsJavaScriptException();
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+  if (closed_.load()) {
+    deferred.Reject(MakeAudioError(env, AUDIO_CAPTURE_STREAM_FAILED, "AudioCapture is closed.").Value());
+    return deferred.Promise();
+  }
+  Ref();
+  StartTask* task = new StartTask(env, this, deferred);
+  task->Queue();
+  return deferred.Promise();
+}
+
+Napi::Value AudioCaptureWrapper::Stop(const Napi::CallbackInfo& info) {
+  return QueueStop(info.Env()).Promise();
+}
+
+Napi::Value AudioCaptureWrapper::On(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (closed_.load()) {
+    throw Napi::Error::New(env, "AudioCapture is closed.");
+  }
+  if (info.Length() < 2 || !info[0].IsString() || !info[1].IsFunction()) {
+    throw Napi::TypeError::New(env, "Expected an event name and a function.");
+  }
+  std::string event = info[0].As<Napi::String>().Utf8Value();
+  Napi::Function callback = info[1].As<Napi::Function>();
+
+  if (event == "stopped") {
+    stoppedFn_.Reset(callback, 1);
     return env.Undefined();
   }
-  Napi::Function cb = info[0].As<Napi::Function>();
+  if (event != "data") {
+    throw Napi::TypeError::New(env, "Unknown event. Use \"data\" or \"stopped\".");
+  }
 
-  {
-    std::lock_guard<std::mutex> lock(tsfnMutex_);
-    if (hasCallback_.load() && tsfn_) {
-      tsfn_.Release();
-      hasCallback_.store(false);
+  std::lock_guard<std::mutex> lock(callbackMu_);
+  if (hasData_) {
+    if (dataHeld_) {
+      dataTsfn_.Unref(env);
+      dataHeld_ = false;
     }
-    // Bounded queue 2 - backpressure: NonBlockingCall will return napi_queue_full if 2 pending
-    tsfn_ = Napi::ThreadSafeFunction::New(
-      env,
-      cb,
-      "AudioDataCallback",
-      2, // maxQueueSize bounded - fixes unlimited queue
-      1,
-      [](Napi::Env) {}
-    );
-    // Unref so TSFN alone does not keep Node alive - fixes process hang on onData() without startCapture
-    tsfn_.Unref(env);
-    hasCallback_.store(true);
-    pendingBatch_.store(false);
+    dataTsfn_.Release();
+    hasData_ = false;
   }
-
-  if (captureHandle_) {
-    AudioCapture_setCallback(captureHandle_,
-      [](const float* data, int32_t frames, int32_t channels, void* userData) {
-        AudioCallback(data, frames, channels, userData);
-      },
-      this);
+  dataTsfn_ = Napi::ThreadSafeFunction::New(env, callback, "AudioCaptureData", 2, 1);
+  dataTsfn_.Unref(env);
+  hasData_ = true;
+  if (running_.load() && !dataHeld_) {
+    dataTsfn_.Ref(env);
+    dataHeld_ = true;
   }
+  return env.Undefined();
+}
 
+Napi::Value AudioCaptureWrapper::Close(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  bool already = closed_.exchange(true);
+  acceptAudio_.store(false, std::memory_order_release);
+  published_.store(false);
+  if (!already) {
+    ReleaseListeners(env);
+    if (running_.exchange(false)) {
+      Unref();
+    }
+    QueueStop(env);
+  }
   return env.Undefined();
 }
 

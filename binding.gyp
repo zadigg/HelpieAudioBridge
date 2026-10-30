@@ -10,12 +10,12 @@
         "<!@(node -p \"require('node-addon-api').include\")"
       ],
       "defines": [
-        "NAPI_DISABLE_CPP_EXCEPTIONS=0",
         "NAPI_VERSION=8"
       ],
       "cflags!": ["-fno-exceptions"],
       "cflags_cc!": ["-fno-exceptions"],
       "xcode_settings": {
+        "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
         "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
         "CLANG_CXX_LIBRARY": "libc++",
         "MACOSX_DEPLOYMENT_TARGET": "13.0",

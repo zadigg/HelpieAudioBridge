@@ -6,6 +6,8 @@
   "main": "index.js",
   "files": [
     "index.js",
+    "index.d.ts",
+    "pcm.h",
     "bin/",
     "audio_capture.h",
     "audio_capture.mm",
@@ -15,9 +17,12 @@
     "build.sh",
     "README.md"
   ],
+  "types": "index.d.ts",
   "scripts": {
     "build": "./build.sh",
-    "check": "node -e \"const { AudioCapture } = require('./'); const cap = new AudioCapture(); console.log(typeof cap.startCapture, typeof cap.stopCapture, typeof cap.onData, typeof cap.clearCallback);\""
+    "build:arm64": "npx node-gyp rebuild --arch=arm64 --release && mkdir -p bin/arm64 && cp build/Release/audio_capture.node bin/arm64/audio_capture_arm64.node && codesign --force --sign - bin/arm64/audio_capture_arm64.node",
+    "check": "node --test tests/lifecycle.test.js",
+    "test": "mkdir -p build && clang++ -std=c++17 -I. tests/ring_buffer_test.cc -o build/ring_buffer_test && build/ring_buffer_test && clang++ -std=c++17 -I. tests/pcm_test.cc -o build/pcm_test && build/pcm_test && node --test --test-concurrency=1 tests/*.test.js"
   },
   "devDependencies": {
     "node-addon-api": "^8.3.0",
